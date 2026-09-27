@@ -7,6 +7,7 @@ import json
 import aiohttp
 import asyncio
 import tempfile
+import time
 
 # ==================== 常量定义 ====================
 
@@ -31,6 +32,8 @@ ALLOWED_IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 # 网络请求超时（避免外部 HTTP 卡住协程）
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+WIFE_LIST_CACHE_TTL_SECONDS = 30 * 60
+WIFE_LIST_RETRY_COOLDOWN_SECONDS = 60
 
 # ==================== 全局数据存储 ====================
 
@@ -247,7 +250,7 @@ def _read_today_slot_mark(marks: dict, uid: str, today: str, size: int) -> int |
     if rec.get("date") != today:
         return None
     slot = rec.get("slot")
-    if not isinstance(slot, int):
+    if type(slot) is not int:
         return None
     if 1 <= slot <= size:
         return slot
@@ -258,11 +261,12 @@ def _infer_today_slot_from_items(items: list, img: str) -> int | None:
     """尝试从背包里推断“今日老婆槽位”（兼容旧数据：抽老婆已入库但未记录绑定）。"""
     if not img or not isinstance(img, str):
         return None
-    for i, entry in enumerate(items, start=1):
-        e_img, _ = backpack_entry_to_img_note(entry)
-        if e_img == img:
-            return i
-    return None
+    matches = [
+        i
+        for i, entry in enumerate(items, start=1)
+        if backpack_entry_to_img_note(entry)[0] == img
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def bind_today_slot(cfg: dict, uid: str, today: str, slot: int) -> None:
@@ -270,23 +274,6 @@ def bind_today_slot(cfg: dict, uid: str, today: str, slot: int) -> None:
     marks = get_today_slot_marks(cfg)
     marks[uid] = {"date": today, "slot": int(slot)}
     cfg[BACKPACK_TODAY_SLOT_KEY] = marks
-
-
-def get_or_infer_today_slot(cfg: dict, uid: str, today: str, size: int, *, items: list | None = None, prefer_img: str | None = None) -> int | None:
-    """获取或推断今日绑定槽位；推断成功会写回 cfg。"""
-    marks = get_today_slot_marks(cfg)
-    slot = _read_today_slot_mark(marks, uid, today, size)
-    if slot is not None:
-        # 确保 key 已存在且为 dict（避免 marks 来源非法导致后续写入丢失）
-        cfg[BACKPACK_TODAY_SLOT_KEY] = marks
-        return slot
-    if items is not None and prefer_img:
-        inferred = _infer_today_slot_from_items(items, prefer_img)
-        if inferred is not None:
-            bind_today_slot(cfg, uid, today, inferred)
-            return inferred
-    cfg[BACKPACK_TODAY_SLOT_KEY] = marks
-    return None
 
 
 def first_empty_slot(items: list) -> int | None:
@@ -339,7 +326,7 @@ def normalize_today_record(raw: object, today: str, *, nick_default: str | None 
             out["nick"] = nick_default
         if isinstance(raw.get("img"), str) and raw.get("img"):
             out["img"] = raw.get("img")
-        if isinstance(raw.get("slot"), int):
+        if type(raw.get("slot")) is int:
             out["slot"] = raw.get("slot")
         return out
 
@@ -402,64 +389,64 @@ def resolve_today_entity(cfg: dict, uid: str, today: str, size: int, *, nick_def
 
     nick = rec.get("nick") if isinstance(rec.get("nick"), str) and rec.get("nick") else (nick_default or None)
     img_field = rec.get("img") if isinstance(rec.get("img"), str) and rec.get("img") else None
-    slot_field = rec.get("slot") if isinstance(rec.get("slot"), int) else None
+    raw_slot = rec.get("slot")
+    explicit_slot = raw_slot if type(raw_slot) is int and 1 <= raw_slot <= size else None
 
     backpacks, items = get_user_backpack(cfg, uid, size)
-    changed = False
+    raw_backpacks = cfg.get(BACKPACKS_KEY)
+    raw_items = raw_backpacks.get(uid) if isinstance(raw_backpacks, dict) else None
+    mark_slot = _read_today_slot_mark(get_today_slot_marks(cfg), uid, today, size)
 
-    # 1) 优先使用绑定槽位（marks），并允许按 img 推断（兼容旧数据）
-    if slot_field is None:
-        inferred = get_or_infer_today_slot(cfg, uid, today, size, items=items, prefer_img=img_field)
-        if inferred is not None:
-            slot_field = inferred
-            changed = True
+    def entry_at(slot: int | None) -> tuple[str | None, str | None]:
+        if slot is None:
+            return None, None
+        return backpack_entry_to_img_note(items[slot - 1])
 
-    # 2) 若有 slot 引用：实体必须只在该槽位存在；cfg[uid] 仅保存引用
-    if slot_field is not None and 1 <= int(slot_field) <= size:
-        slot_field = int(slot_field)
-        e_img, note = backpack_entry_to_img_note(items[slot_field - 1] if slot_field - 1 < len(items) else None)
-        if not e_img and img_field:
-            # 修复：槽位为空但 cfg 还留着 img -> 把实体落回槽位，并去重
-            items[slot_field - 1] = make_backpack_entry(img_field)
-            e_img, note = img_field, None
-            changed = True
-        if not e_img:
-            # 槽位引用失效 -> 清理今日记录与绑定（不动背包其他槽位）
-            try:
-                del cfg[uid]
-            except Exception:
-                pass
-            if clear_today_binding(cfg, uid, today):
-                changed = True
-            return None, None, nick, None, True
+    explicit_img, _ = entry_at(explicit_slot)
+    marked_img, _ = entry_at(mark_slot)
+    resolved_slot: int | None = None
 
-        # 若旧格式/错误格式：写回标准引用格式（并清掉 img 字段，避免重复存储）
-        if not (isinstance(raw, dict) and raw.get("date") == today and raw.get("slot") == slot_field and raw.get("nick") == nick and "img" not in raw):
-            cfg[uid] = {"date": today, "slot": slot_field, "nick": nick}
-            changed = True
+    if explicit_img:
+        resolved_slot = explicit_slot
+    elif marked_img and (not img_field or marked_img == img_field):
+        resolved_slot = mark_slot
+    elif img_field:
+        resolved_slot = _infer_today_slot_from_items(items, img_field)
 
-        # 写回背包与绑定标记（items 可能被 normalize 过）
+    if resolved_slot is not None:
+        resolved_img, note = entry_at(resolved_slot)
+        canonical_record = {"date": today, "slot": resolved_slot, "nick": nick}
+        canonical_mark = {"date": today, "slot": resolved_slot}
+        marks_raw = cfg.get(BACKPACK_TODAY_SLOT_KEY)
+        old_mark = marks_raw.get(uid) if isinstance(marks_raw, dict) else None
+        changed = (
+            raw != canonical_record
+            or raw_items != items
+            or not isinstance(raw_backpacks, dict)
+            or old_mark != canonical_mark
+        )
         backpacks[uid] = items
         cfg[BACKPACKS_KEY] = backpacks
-        bind_today_slot(cfg, uid, today, slot_field)
-        return e_img, slot_field, nick, note, changed
+        cfg[uid] = canonical_record
+        bind_today_slot(cfg, uid, today, resolved_slot)
+        return resolved_img, resolved_slot, nick, note, changed
 
-    # 3) 无 slot：实体为临时态，只保留在 cfg[uid]["img"]
     if img_field:
-        if not (isinstance(raw, dict) and raw.get("date") == today and raw.get("img") == img_field and raw.get("nick") == nick):
-            cfg[uid] = {"date": today, "img": img_field, "nick": nick}
-            changed = True
+        canonical_record = {"date": today, "img": img_field, "nick": nick}
+        changed = raw != canonical_record or raw_items != items
+        if raw_items != items or not isinstance(raw_backpacks, dict):
+            backpacks[uid] = items
+            cfg[BACKPACKS_KEY] = backpacks
+        cfg[uid] = canonical_record
         if clear_today_binding(cfg, uid, today):
             changed = True
         return img_field, None, nick, None, changed
 
-    # 兜底：无 img 且无 slot -> 清理
     try:
         del cfg[uid]
     except Exception:
         pass
-    if clear_today_binding(cfg, uid, today):
-        changed = True
+    clear_today_binding(cfg, uid, today)
     return None, None, nick, None, True
 
 
@@ -589,6 +576,11 @@ class WifePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._http_session: aiohttp.ClientSession | None = None
+        self._wife_list_cache: list[str] | None = None
+        self._wife_list_cache_expires_at = 0.0
+        self._wife_list_retry_after = 0.0
+        self._wife_list_lock = asyncio.Lock()
         self._init_config()
         self._init_commands()
         self.admins = self.load_admins()
@@ -777,42 +769,80 @@ class WifePlugin(Star):
         imgs = await self._list_wife_images()
         return random.choice(imgs) if imgs else None
 
-    async def _list_wife_images(self) -> list[str]:
-        """获取老婆图片文件名列表（本地优先，其次网络）。"""
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(
+                timeout=HTTP_TIMEOUT,
+                trust_env=True,
+            )
+        return self._http_session
+
+    def _read_local_wife_images(self) -> list[str]:
+        list_path = os.path.join(PLUGIN_DIR, "list.txt")
         try:
-            local_imgs = [
-                normalize_img_id(x)
-                for x in os.listdir(IMG_DIR)
-                if x
-                and os.path.isfile(os.path.join(IMG_DIR, x))
-                and normalize_img_id(x)
-            ]
-            if local_imgs:
-                return local_imgs
-        except Exception:
+            with open(list_path, "r", encoding="utf-8-sig") as f:
+                imgs = self._parse_wife_image_list(f.read())
+            if imgs:
+                return imgs
+        except (OSError, UnicodeError):
             pass
 
-        url = (self.image_list_url or self.image_base_url or "").strip()
-        if not url:
+        try:
+            return sorted(
+                rel
+                for name in os.listdir(IMG_DIR)
+                if os.path.isfile(os.path.join(IMG_DIR, name))
+                and (rel := normalize_img_id(name))
+            )
+        except OSError:
             return []
 
-        try:
-            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        return []
-                    text = await resp.text()
-                    out: list[str] = []
-                    for line in text.splitlines():
-                        s = line.strip()
-                        if not s:
-                            continue
-                        rel = normalize_img_id(s)
-                        if rel:
-                            out.append(rel)
-                    return out
-        except Exception:
-            return []
+    @staticmethod
+    def _parse_wife_image_list(text: str) -> list[str]:
+        imgs: list[str] = []
+        seen: set[str] = set()
+        for line in text.splitlines():
+            rel = normalize_img_id(line.strip())
+            if rel and rel not in seen:
+                seen.add(rel)
+                imgs.append(rel)
+        return imgs
+
+    async def _list_wife_images(self) -> list[str]:
+        """获取老婆图片列表：远端优先，失败时回退缓存与本地列表。"""
+        url = (self.image_list_url or self.image_base_url or "").strip()
+        now = time.monotonic()
+        if self._wife_list_cache and now < self._wife_list_cache_expires_at:
+            return list(self._wife_list_cache)
+
+        async with self._wife_list_lock:
+            now = time.monotonic()
+            if self._wife_list_cache and now < self._wife_list_cache_expires_at:
+                return list(self._wife_list_cache)
+            if now < self._wife_list_retry_after:
+                if self._wife_list_cache:
+                    return list(self._wife_list_cache)
+                return self._read_local_wife_images()
+
+            if url:
+                try:
+                    session = await self._get_http_session()
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"image list returned HTTP {resp.status}")
+                        imgs = self._parse_wife_image_list(await resp.text())
+                    if not imgs:
+                        raise ValueError("image list response contained no valid entries")
+                    self._wife_list_cache = imgs
+                    self._wife_list_cache_expires_at = time.monotonic() + WIFE_LIST_CACHE_TTL_SECONDS
+                    self._wife_list_retry_after = 0.0
+                    return list(imgs)
+                except Exception:
+                    self._wife_list_retry_after = time.monotonic() + WIFE_LIST_RETRY_COOLDOWN_SECONDS
+
+            if self._wife_list_cache:
+                return list(self._wife_list_cache)
+            return self._read_local_wife_images()
 
     def _build_wife_message(self, img: str, nick: str, *, extra_lines: list[str] | None = None):
         """构建老婆消息链"""
@@ -843,7 +873,7 @@ class WifePlugin(Star):
 • 抽老婆 - 每天抽取一个二次元老婆
 • 老婆背包 - 查看自己的老婆背包列表
 • 查老婆 <编号> - 查看自己的背包老婆(带图)
-• 查老婆 [@用户] - 查看别人的老婆
+• 查老婆 [@用户/昵称] - 查看对方完整背包(标注今日老婆)
 • 替换老婆 <编号> - 用“今天的老婆”替换背包指定位置
 
 【牛老婆功能】(概率较低😭)
@@ -887,10 +917,39 @@ class WifePlugin(Star):
                     yield res
                 return
 
-        # 用法2: 查老婆 [@用户/昵称] -> 查对方今日老婆（兼容旧行为）
-        tid = self.parse_target(event) or uid
+        # 用法2: 查老婆 [@用户/昵称] -> 查看对方完整背包
+        tid = self.parse_target(event)
         today = get_today()
         size = self.backpack_size
+
+        if tid:
+            tid = str(tid)
+            async with get_config_lock(gid):
+                cfg = load_group_config(gid)
+                owner_nick = get_cfg_nick(cfg, tid, tid)
+                today_img, today_slot, _, _, changed = resolve_today_entity(
+                    cfg, tid, today, size, nick_default=owner_nick
+                )
+                _, items = get_user_backpack(cfg, tid, size)
+                if changed:
+                    save_group_config(gid, cfg)
+
+            used = sum(1 for entry in items if backpack_entry_to_img_note(entry)[0])
+            lines = []
+            for slot_index, entry in enumerate(items, start=1):
+                marker = "（今日老婆）" if slot_index == today_slot else ""
+                lines.append(f"{slot_index}. {format_backpack_item(entry)}{marker}")
+            if today_img and today_slot is None:
+                lines.append(f"今日老婆未存入背包：{format_wife_name(today_img)}")
+            elif not today_img:
+                lines.append("当前没有今日老婆记录。")
+
+            text = f"{owner_nick}的老婆背包（{used}/{size}）：\n" + "\n".join(lines)
+            yield event.plain_result(text)
+            return
+
+        # 无目标时保留原行为：查询自己的今日老婆。
+        tid = uid
         owner_nick = None
         note: str | None = None
         
@@ -1853,6 +1912,10 @@ class WifePlugin(Star):
     async def terminate(self):
         """插件卸载时清理资源"""
         global config_locks, records, swap_requests, ntr_statuses
+
+        session, self._http_session = self._http_session, None
+        if session and not session.closed:
+            await session.close()
         
         # 清理群组配置锁
         config_locks.clear()
